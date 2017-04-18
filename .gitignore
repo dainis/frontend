@@ -15,3 +15,5 @@ src/plugins/*
 src/libraries/plugins/*
 src/userdata/**/*
 !default
+
+docker-compose.yml

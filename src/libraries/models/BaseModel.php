@@ -23,7 +23,7 @@ class BaseModel
     $this->owner = null;
     if(isset($this->config->user))
       $this->owner = $this->config->user->email;
-    
+
     // really just for setup when the systems don't yet exist
     if(isset($this->config->systems))
     {

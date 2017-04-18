@@ -1,4 +1,8 @@
 <?php
+
+use Aws\S3\S3Client;
+
+
 /**
  * Amazon AWS S3 implementation for FileSystemInterface
  *
@@ -33,7 +37,14 @@ class FileSystemS3 implements FileSystemInterface
     else
     {
       $utilityObj = new Utility;
-      $this->fs = new AmazonS3($utilityObj->decrypt($this->config->credentials->awsKey), $utilityObj->decrypt($this->config->credentials->awsSecret));
+      $this->fs = new S3Client([
+        'credentials' => [
+          'key' => $utilityObj->decrypt($this->config->credentials->awsKey),
+          'secret' => $utilityObj->decrypt($this->config->credentials->awsSecret)
+        ],
+        'region' => 'eu-central-1',
+        'version' => 'latest'
+      ]);
     }
 
     $this->bucket = $this->config->aws->s3BucketName;
@@ -48,14 +59,24 @@ class FileSystemS3 implements FileSystemInterface
     */
   public function deletePhoto($photo)
   {
-    $queue = $this->getBatchRequest();
+    $objects = [];
+
     foreach($photo as $key => $value)
     {
       if(strncmp($key, 'path', 4) === 0)
-        $this->fs->batch($queue)->delete_object($this->bucket, $this->normalizePath($value));
+      {
+        $objects[] = ['Key' => $this->normalizePath($value)];
+      }
     }
-    $responses = $this->fs->batch($queue)->send();
-    return $responses->areOK();
+
+    $response = $this->fs->deleteObjects([
+      'Bucket' => $this->bucket,
+      'Delete' => [
+        'Objects' => $objects
+      ]
+    ]);
+
+    return empty($response['Errors']);
   }
 
   public function downloadPhoto($photo)
@@ -73,12 +94,12 @@ class FileSystemS3 implements FileSystemInterface
   {
     $utilityObj = new Utility;
     $diagnostics = array();
-    $aclCheck = $this->fs->get_bucket_acl($this->bucket);
-    if((int)$aclCheck->status == 200)
+    $exists = $this->fs->doesBucketExist($this->bucket);
+
+    if($exists)
     {
       $storageSize = $this->fs->get_bucket_filesize($this->bucket, true);
       $diagnostics[] = $utilityObj->diagnosticLine(true, sprintf('Connection to bucket "%s" is okay.', $this->bucket));
-      $diagnostics[] = $utilityObj->diagnosticLine(true, sprintf('Total space used in bucket "%s" is %s.', $this->bucket, $storageSize));
     }
     else
     {
@@ -112,10 +133,19 @@ class FileSystemS3 implements FileSystemInterface
   {
     $filename = $this->normalizePath($filename);
     $tmpname = '/tmp/'.uniqid('opme', true);
-    $fp = fopen($tmpname, 'w+');
-    $res = $this->fs->get_object($this->bucket, $filename, array('fileDownload' => $fp));
-    fclose($fp);
-    return $res->isOK() ? $tmpname : false;
+    try
+    {
+      $this->fs->getObject([
+        'Bucket' => $this->bucket,
+        'Key' => $filename,
+        'SaveAs' => $tmpname
+      ]);
+      return $tmpname;
+    } catch(Exception $e)
+    {
+      getLogger()->warn("The photo {$filename} could not be downloaded {$e}");
+      return false;
+    }
   }
 
   /**
@@ -131,7 +161,7 @@ class FileSystemS3 implements FileSystemInterface
     $this->$name = $value;
   }
 
-  // TODO Gh-420 the $acl should be moved into a config and not exist in the signature 
+  // TODO Gh-420 the $acl should be moved into a config and not exist in the signature
   /**
     * Writes/uploads a new photo to the remote file system.
     *
@@ -142,7 +172,7 @@ class FileSystemS3 implements FileSystemInterface
     */
   public function putPhoto($localFile, $remoteFile, $dateTaken)
   {
-    $acl = AmazonS3::ACL_PUBLIC;
+    $acl = 'public-read';
     if(!file_exists($localFile))
     {
       getLogger()->warn("The photo {$localFile} does not exist so putPhoto failed");
@@ -156,10 +186,17 @@ class FileSystemS3 implements FileSystemInterface
 
     $remoteFile = $this->normalizePath($remoteFile);
     $opts = $this->getUploadOpts($localFile, $acl);
-    $res = $this->fs->create_object($this->bucket, $remoteFile, $opts);
-    if(!$res->isOK())
-      getLogger()->crit('Could not put photo on the file system: ' . var_export($res, 1));
-    return $res->isOK();
+
+    $opts['Key'] = $remoteFile;
+
+    try {
+      $this->fs->PutObject($opts);
+      return true;
+    } catch(Exception $e)
+    {
+      getLogger()->crit('Could not put photo on the file system: ' . $e);
+      return false;
+    }
   }
 
   /**
@@ -173,24 +210,18 @@ class FileSystemS3 implements FileSystemInterface
     */
   public function putPhotos($files)
   {
-    $acl = AmazonS3::ACL_PUBLIC;
-    $queue = $this->getBatchRequest();
+    $allOk = true;
     foreach($files as $file)
     {
       list($localFile, $remoteFileArr) = each($file);
       $remoteFile = $remoteFileArr[0];
       $dateTaken = $remoteFileArr[1];
-      $opts = $this->getUploadOpts($localFile, $acl);
       $remoteFile = $this->normalizePath($remoteFile);
-      $this->fs->batch($queue)->create_object($this->bucket, $remoteFile, $opts);
+
+      $allOk = $this->putPhoto($localFile, $remoteFile, $dateTaken) || $allOk;
     }
-    $responses = $this->fs->batch($queue)->send();
-    if(!$responses->areOK())
-    {
-      foreach($responses as $resp)
-        getLogger()->crit(var_export($resp, 1));
-    }
-    return $responses->areOK();
+
+    return $allOk;
   }
 
   /**
@@ -229,45 +260,57 @@ class FileSystemS3 implements FileSystemInterface
   public function initialize($isEditMode)
   {
     getLogger()->info('Initializing file system');
-    if(!$this->fs->validate_bucketname_create($this->bucket) || !$this->fs->validate_bucketname_support($this->bucket))
+    if(!$this->fs->isBucketDnsCompatible($this->bucket))
     {
       getLogger()->warn("The bucket name you provided ({$this->bucket}) is invalid.");
       return false;
     }
 
-    $buckets = $this->fs->get_bucket_list("/^{$this->bucket}$/");
-    if(count($buckets) == 0)
+    $exists = $this->fs->doesBucketExist($this->bucket);
+
+    if(!$exists)
     {
       getLogger()->info("Bucket {$this->bucket} does not exist, creating it now");
-      $res = $this->fs->create_bucket($this->bucket, AmazonS3::REGION_US_E1, AmazonS3::ACL_PRIVATE);
-      if(!$res->isOK())
+      try
       {
-        getLogger()->crit('Could not create S3 bucket: ' . var_export($res, 1));
+        $res = $this->fs->createBucket([
+          'Bucket' => $this->bucket,
+          'ACL' => 'private'
+        ]);
+      } catch (Exception $e)
+      {
+        getLogger()->crit('Could not create S3 bucket: ' . $e);
         return false;
       }
     }
 
-    // DreamObjects doesn't seem to support this #1000
-    // TODO add versioning?
-    // Set a policy for this bucket only
-    $policy = new CFPolicy($this->fs, array(
-        'Version' => '2008-10-17',
-        'Statement' => array(
-            array(
-                'Sid' => 'AddPerm',
-                'Effect' => 'Allow',
-                'Principal' => array(
-                    'AWS' => '*'
-                ),
-                'Action' => array('s3:*'),
-                'Resource' => array("arn:aws:s3:::{$this->bucket}/*")
-            )
-        )
-    ));
-    $res = $this->fs->set_bucket_policy($this->bucket, $policy);
-    if(!$res->isOK())
-      getLogger()->crit('Failed to set bucket policy');
-    return $res->isOK();
+    $policy =json_encode([
+      'Version' => '2008-10-17',
+      'Statement' => array(
+          array(
+              'Sid' => 'AddPerm',
+              'Effect' => 'Allow',
+              'Principal' => array(
+                  'AWS' => '*'
+              ),
+              'Action' => array('s3:*'),
+              'Resource' => array("arn:aws:s3:::{$this->bucket}/*")
+          )
+      )
+    ]);
+
+    try
+    {
+      $res = $this->fs->PutBucketPolicy([
+        'Bucket' => $this->bucket,
+        'Policy' => $policy
+      ]);
+    } catch(Exception $e)
+    {
+      getLogger()->crit('Failed to set bucket policy' . $e);
+    }
+
+    return true;
   }
 
   /**
@@ -299,9 +342,7 @@ class FileSystemS3 implements FileSystemInterface
   }
 
   public function setSSL($bool)
-  {
-    $this->fs->use_ssl = $bool;
-  }
+  {}
 
   public function setUploadType($type)
   {
@@ -310,20 +351,21 @@ class FileSystemS3 implements FileSystemInterface
 
   public function getUploadOpts($localFile, $acl)
   {
-    $opts = array('acl' => $acl, 'contentType' => 'image/jpeg');
-    if($this->uploadType === self::uploadTypeAttach)
-      $opts['fileUpload'] = $localFile;
-    elseif($this->uploadType === self::uploadTypeInline)
-      $opts['body'] = file_get_contents($localFile);
+    $opts = [
+      'ACL' => $acl,
+      'ContentType' => 'image/jpeg',
+      'Bucket' => $this->bucket
+    ];
 
-    if(isset($this->headers))
+    if($this->uploadType === self::uploadTypeAttach)
     {
-      if(isset($opt['headers']))
-        $opts['headers'] = array_merge($this->headers, $opts['headers']);
-      else
-        $opts['headers'] = $this->headers;
+      $opts['SourceFile'] = $localFile;
     }
-    
+    elseif($this->uploadType === self::uploadTypeInline)
+    {
+      $opts['Body'] = file_get_contents($localFile);
+    }
+
     return $opts;
   }
 }

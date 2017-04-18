@@ -46,7 +46,7 @@ abstract class Media extends BaseModel
     // make sure the defaults are set (this method sets to null if not already set)
     $attributes = $this->requireDefaults($attributes);
     // we remove attributes which aren't valid
-    //  gh-1428 this needs to be done before the later methods that modify $attributes 
+    //  gh-1428 this needs to be done before the later methods that modify $attributes
     $attributes = $this->whitelistAttributes($attributes);
 
     // set all of the date and tag parameters
@@ -71,12 +71,12 @@ abstract class Media extends BaseModel
   public function requireDefaults($attributes)
   {
     $defaults = array(
-      'appId' => $this->config->application->appId, 
-      'host' => $this->fs->getHost(), 
-      'title'=>null, 
-      'description'=>null, 
-      'tags'=>null, 
-      'latitude'=>null, 
+      'appId' => $this->config->application->appId,
+      'host' => $this->fs->getHost(),
+      'title'=>null,
+      'description'=>null,
+      'tags'=>null,
+      'latitude'=>null,
       'longitude'=>null,
       'views' => 0,
       'status' => 1,
@@ -111,7 +111,7 @@ abstract class Media extends BaseModel
 
     $allowAutoRotate = isset($attributes['allowAutoRotate']) ? $attributes['allowAutoRotate'] : '1';
     $exif = $this->readExif($localFile, $allowAutoRotate);
-    
+
     // gh-1428 map exif to whitelisted attributes
     $exifMap = array('width' => 'width', 'height' => 'height', 'cameraMake' => 'exifCameraMake', 'cameraModel' => 'exifCameraModel',
       'FNumber' => 'exifFNumber', 'exposureTime' => 'exifExposureTime', 'ISO' => 'exifISOSpeed', 'focalLength' => 'exifFocalLength', 'latitude' => 'latitude', 'longitude' => 'longitude');
